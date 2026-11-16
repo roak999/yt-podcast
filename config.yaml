@@ -46,10 +46,11 @@ script:
       voice: Aoede
       edge_voice: ja-JP-NanamiNeural
 
+# モデル名は [第1候補, 予備…] の順に書く。第1候補が使えない（終了・名前変更）ときは自動で次を試す
 models:
-  summary: gemini-flash-latest   # 動画の要約（安くしたい場合は gemini-flash-lite-latest）
-  script: gemini-flash-latest    # 台本づくり
-  tts: gemini-3.1-flash-tts-preview  # 音声合成（安くしたい場合は gemini-2.5-flash-preview-tts）
+  summary: [gemini-3.8-flash, gemini-3.6-flash, gemini-3.5-flash]     # 動画の要約（安くしたい場合は先頭を gemini-3.5-flash-lite に）
+  script: [gemini-3.8-flash, gemini-3.6-flash, gemini-3.5-flash]      # 台本づくり
+  tts: [gemini-3.8-flash-tts, gemini-3.1-flash-tts-preview]          # 音声合成（安くしたい場合は先頭を gemini-3.8-flash-lite-tts に）
 
 tts:
   backend: gemini        # gemini（高品質・有料枠あり） / edge（無料・やや機械的）
