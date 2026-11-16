@@ -52,6 +52,12 @@ def is_not_found(e: Exception) -> bool:
     return "NOT_FOUND" in str(e) or "404" in str(e)[:20]
 
 
+def is_busy(e: Exception) -> bool:
+    """混雑(503)や回数制限(429)。別のモデルに切り替えると通ることが多い。"""
+    t = str(e)[:40]
+    return any(k in t for k in ("503", "UNAVAILABLE", "429", "RESOURCE_EXHAUSTED"))
+
+
 def with_retry(fn, what: str, tries: int = 4, base: int = 30):
     for i in range(tries):
         try:
@@ -69,16 +75,24 @@ def model_list(v) -> list[str]:
 
 
 def with_models(models, fn, what: str):
-    """候補のモデルを順に試す。モデルが存在しない(404)ときだけ次の候補へ。"""
+    """候補のモデルを順に試す。使えない・混雑しているときは次の候補へ。
+    全候補が混雑していたら、少し待ってからもう一巡する。"""
     names = model_list(models)
-    for i, m in enumerate(names):
-        try:
-            return with_retry(lambda: fn(m), f"{what}（{m}）", tries=3)
-        except Exception as e:  # noqa: BLE001
-            if is_not_found(e) and i < len(names) - 1:
-                log(f"  モデル {m} は使えません → {names[i + 1]} を試します")
-                continue
-            raise
+    for rnd in range(3):
+        for i, m in enumerate(names):
+            try:
+                return with_retry(lambda: fn(m), f"{what}（{m}）", tries=2, base=15)
+            except Exception as e:  # noqa: BLE001
+                if not (is_not_found(e) or is_busy(e)):
+                    raise
+                last = e
+                nxt = names[i + 1] if i < len(names) - 1 else None
+                if nxt:
+                    log(f"  {m} は{'使えません' if is_not_found(e) else '混雑中'} → {nxt} を試します")
+        if not is_busy(last) or rnd == 2:
+            raise last
+        log("  すべてのモデルが混雑中 → 2分待って再挑戦")
+        time.sleep(120)
 
 
 # ---------------------------------------------------------------- state
