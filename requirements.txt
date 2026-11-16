@@ -1,0 +1,4 @@
+google-genai>=1.30
+requests>=2.31
+PyYAML>=6.0
+edge-tts>=7.0

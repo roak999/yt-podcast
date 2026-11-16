@@ -1,0 +1,23 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="robots" content="noindex">
+<title>投資YouTube デイリーまとめ</title>
+<style>
+  body { font-family: system-ui, sans-serif; max-width: 640px; margin: 2rem auto; padding: 0 1rem; line-height: 1.7; }
+  code { background: #f2f2f2; padding: .2rem .4rem; border-radius: 4px; word-break: break-all; }
+  button { margin-top: .5rem; padding: .5rem 1rem; }
+</style>
+</head>
+<body>
+  <h1>投資YouTube デイリーまとめ</h1>
+  <p>ポッドキャストアプリに、次のURLを「URLで番組を追加」として登録してください。</p>
+  <p><code id="feed"></code></p>
+  <button onclick="navigator.clipboard.writeText(document.getElementById('feed').textContent)">URLをコピー</button>
+  <script>
+    document.getElementById('feed').textContent = new URL('feed.xml', location.href).href;
+  </script>
+</body>
+</html>
