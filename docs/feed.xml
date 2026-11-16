@@ -1,0 +1,15 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<rss version="2.0" xmlns:itunes="http://www.itunes.com/dtds/podcast-1.0.dtd" xmlns:atom="http://www.w3.org/2005/Atom">
+  <channel>
+    <title>投資YouTube デイリーまとめ</title>
+    <link>https://roak999.github.io/yt-podcast/</link>
+    <atom:link href="https://roak999.github.io/yt-podcast/feed.xml" rel="self" type="application/rss+xml"/>
+    <description>フォローしている投資系YouTubeチャンネルの新着動画を、毎日2人の掛け合いで解説する個人用ポッドキャスト。</description>
+    <language>ja</language>
+    <itunes:author>自分用</itunes:author>
+    <itunes:block>Yes</itunes:block>
+    <itunes:explicit>false</itunes:explicit>
+    <itunes:category text="Business"><itunes:category text="Investing"/></itunes:category>
+
+  </channel>
+</rss>
