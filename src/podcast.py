@@ -48,16 +48,37 @@ def log(*a):
     print(*a, flush=True)
 
 
+def is_not_found(e: Exception) -> bool:
+    return "NOT_FOUND" in str(e) or "404" in str(e)[:20]
+
+
 def with_retry(fn, what: str, tries: int = 4, base: int = 30):
     for i in range(tries):
         try:
             return fn()
         except Exception as e:  # noqa: BLE001
-            if i == tries - 1:
+            if i == tries - 1 or is_not_found(e):
                 raise
             wait = base * (2 ** i)
             log(f"  {what} 失敗: {e} → {wait}秒後に再試行")
             time.sleep(wait)
+
+
+def model_list(v) -> list[str]:
+    return [v] if isinstance(v, str) else list(v)
+
+
+def with_models(models, fn, what: str):
+    """候補のモデルを順に試す。モデルが存在しない(404)ときだけ次の候補へ。"""
+    names = model_list(models)
+    for i, m in enumerate(names):
+        try:
+            return with_retry(lambda: fn(m), f"{what}（{m}）", tries=3)
+        except Exception as e:  # noqa: BLE001
+            if is_not_found(e) and i < len(names) - 1:
+                log(f"  モデル {m} は使えません → {names[i + 1]} を試します")
+                continue
+            raise
 
 
 # ---------------------------------------------------------------- state
@@ -162,10 +183,10 @@ SUMMARY_PROMPT = """あなたは投資系YouTube動画の内容を正確に記�
 """
 
 
-def summarize(client, model: str, v: dict) -> str:
+def summarize(client, models, v: dict) -> str:
     from google.genai import types
 
-    def call():
+    def call(model):
         r = client.models.generate_content(
             model=model,
             contents=types.Content(parts=[
@@ -178,7 +199,7 @@ def summarize(client, model: str, v: dict) -> str:
             raise RuntimeError("空の応答")
         return r.text
 
-    return with_retry(call, f"要約 {v['id']}", tries=3)
+    return with_models(models, call, f"要約 {v['id']}")
 
 
 # ---------------------------------------------------------------- 3. 台本
@@ -224,9 +245,9 @@ def make_script(client, cfg: dict, notes: str, today: dt.date) -> dict:
         title=cfg["podcast"]["title"], date=f"{today.year}年{today.month}月{today.day}日",
         chars=s["target_minutes"] * 320, minutes=s["target_minutes"], notes=notes)
 
-    def call():
+    def call(model):
         r = client.models.generate_content(
-            model=cfg["models"]["script"], contents=prompt,
+            model=model, contents=prompt,
             config=types.GenerateContentConfig(response_mime_type="application/json", max_output_tokens=60000))
         data = json.loads(r.text)
         names = {a["name"], b["name"]}
@@ -237,7 +258,7 @@ def make_script(client, cfg: dict, notes: str, today: dt.date) -> dict:
         data["lines"] = lines
         return data
 
-    return with_retry(call, "台本作成", tries=3)
+    return with_models(cfg["models"]["script"], call, "台本作成")
 
 
 # ---------------------------------------------------------------- 4. 音声
@@ -273,14 +294,15 @@ def tts_gemini(client, cfg: dict, lines: list[dict]) -> bytes:
             for h in hosts]))
     prefix = TTS_PREFIX.format(a=hosts[0]["name"], b=hosts[1]["name"])
     chunks = chunk_lines(lines, t["chunk_chars"])
+    tts_models = model_list(cfg["models"]["tts"])
     pcm = bytearray()
     for i, ch in enumerate(chunks, 1):
         text = prefix + "\n".join(f"{l['speaker']}: {l['text']}" for l in ch)
         n_chars = sum(len(l["text"]) for l in ch)
 
-        def call():
+        def call(model):
             r = client.models.generate_content(
-                model=cfg["models"]["tts"], contents=text,
+                model=model, contents=text,
                 config=types.GenerateContentConfig(response_modalities=["AUDIO"], speech_config=speech))
             part = r.candidates[0].content.parts[0].inline_data
             data = part.data
@@ -293,7 +315,7 @@ def tts_gemini(client, cfg: dict, lines: list[dict]) -> bytes:
             return data
 
         log(f"  音声合成 {i}/{len(chunks)}（{n_chars}文字）")
-        pcm += with_retry(call, f"音声合成 {i}") + silence(0.4)
+        pcm += with_models(tts_models, call, f"音声合成 {i}") + silence(0.4)
         if i < len(chunks):
             time.sleep(t["wait_seconds"])
     return bytes(pcm)
@@ -404,7 +426,9 @@ def main():
         return finish_without_episode("新着がないため今日はお休みです。")
 
     from google import genai
-    client = genai.Client(api_key=os.environ["GEMINI_API_KEY"])
+    from google.genai import types
+    client = genai.Client(api_key=os.environ["GEMINI_API_KEY"],
+                          http_options=types.HttpOptions(api_version="v1beta"))
 
     notes, done = [], []
     for v in videos:
