@@ -63,6 +63,15 @@ def is_bad_request(e: Exception) -> bool:
     return "INVALID_ARGUMENT" in str(e)[:40]
 
 
+def is_daily_limit(e: Exception) -> bool:
+    """無料枠の1日の上限に達した。そのモデルは翌日（日本時間17時ごろ）まで使えない。"""
+    t = str(e)
+    return "RESOURCE_EXHAUSTED" in t and ("PerDay" in t or "per day" in t)
+
+
+EXHAUSTED: set[str] = set()  # この実行中、1日の上限に達したモデル
+
+
 def is_busy(e: Exception) -> bool:
     """混雑(503)や回数制限(429)。別のモデルに切り替えると通ることが多い。"""
     t = str(e)[:40]
@@ -74,7 +83,7 @@ def with_retry(fn, what: str, tries: int = 4, base: int = 30):
         try:
             return fn()
         except Exception as e:  # noqa: BLE001
-            if i == tries - 1 or is_not_found(e) or is_bad_request(e):
+            if i == tries - 1 or is_not_found(e) or is_bad_request(e) or is_daily_limit(e):
                 raise
             wait = base * (2 ** i)
             log(f"  {what} 失敗: {e} → {wait}秒後に再試行")
@@ -89,18 +98,29 @@ def with_models(models, fn, what: str):
     """候補のモデルを順に試す。使えない・混雑しているときは次の候補へ。
     全候補が混雑していたら、少し待ってからもう一巡する。"""
     names = model_list(models)
+    last = None
     for rnd in range(3):
         for i, m in enumerate(names):
+            if m in EXHAUSTED:
+                continue
             try:
                 return with_retry(lambda: fn(m), f"{what}（{m}）", tries=2, base=15)
             except Exception as e:  # noqa: BLE001
                 if not (is_not_found(e) or is_busy(e) or is_bad_request(e)):
                     raise
                 last = e
-                nxt = names[i + 1] if i < len(names) - 1 else None
-                if nxt:
+                if is_daily_limit(e):
+                    EXHAUSTED.add(m)
+                    why = "今日の無料枠を使い切りました"
+                else:
                     why = "混雑中" if is_busy(e) else "使えません"
+                nxt = next((n for n in names[i + 1:] if n not in EXHAUSTED), None)
+                if nxt:
                     log(f"  {m} は{why} → {nxt} を試します")
+        if last is None:
+            raise RuntimeError(f"{what}: 使えるモデルがありません（すべて今日の無料枠を使い切り）")
+        if all(n in EXHAUSTED for n in names):
+            raise RuntimeError(f"{what}: すべてのモデルが今日の無料枠を使い切りました。日本時間17時ごろに回復します")
         if not is_busy(last) or rnd == 2:
             raise last
         log("  すべてのモデルが混雑中 → 2分待って再挑戦")
