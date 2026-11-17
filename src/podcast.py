@@ -25,6 +25,7 @@ import sys
 import tempfile
 import time
 import xml.etree.ElementTree as ET
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 from xml.sax.saxutils import escape
 
@@ -34,6 +35,7 @@ import yaml
 ROOT = Path(__file__).resolve().parent.parent
 CONFIG = ROOT / "config.yaml"
 STATE = ROOT / "state" / "state.json"
+CACHE = ROOT / "state" / "summaries"  # 要約の途中保存（実行が止まっても次回はここから再開）
 DOCS = ROOT / "docs"
 OUT = ROOT / "out"
 
@@ -44,8 +46,12 @@ UA = {"User-Agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, 
       "Accept-Language": "ja,en;q=0.8"}
 
 
+_LOG_LOCK = __import__("threading").Lock()
+
+
 def log(*a):
-    print(*a, flush=True)
+    with _LOG_LOCK:
+        print(*a, flush=True)
 
 
 def is_not_found(e: Exception) -> bool:
@@ -197,23 +203,68 @@ SUMMARY_PROMPT = """あなたは投資系YouTube動画の内容を正確に記�
 """
 
 
-def summarize(client, models, v: dict) -> str:
+def summarize(client, models, v: dict, fps: float | None = 0.2) -> str:
+    """fps: 映像を何秒に1コマ見るか（0.2 = 5秒に1コマ）。投資動画は話が中心なので少なくて十分で、速く安くなる。"""
     from google.genai import types
+    opt = {"fps": fps}
 
     def call(model):
-        r = client.models.generate_content(
-            model=model,
-            contents=types.Content(parts=[
-                types.Part(file_data=types.FileData(file_uri=v["url"])),
-                types.Part(text=SUMMARY_PROMPT.format(**v)),
-            ]),
-            config=types.GenerateContentConfig(media_resolution=types.MediaResolution.MEDIA_RESOLUTION_LOW),
-        )
+        meta = types.VideoMetadata(fps=opt["fps"]) if opt["fps"] else None
+        try:
+            r = client.models.generate_content(
+                model=model,
+                contents=types.Content(parts=[
+                    types.Part(file_data=types.FileData(file_uri=v["url"]), video_metadata=meta),
+                    types.Part(text=SUMMARY_PROMPT.format(**v)),
+                ]),
+                config=types.GenerateContentConfig(media_resolution=types.MediaResolution.MEDIA_RESOLUTION_LOW),
+            )
+        except Exception as e:  # noqa: BLE001
+            if opt["fps"] and "INVALID_ARGUMENT" in str(e):
+                log("  コマ数の指定が使えないため、通常設定でやり直します")
+                opt["fps"] = None
+                return call(model)
+            raise
         if not r.text:
             raise RuntimeError("空の応答")
         return r.text
 
     return with_models(models, call, f"要約 {v['id']}")
+
+
+def summarize_all(client, cfg: dict, videos: list[dict]) -> tuple[list[dict], list[str]]:
+    """複数の動画を同時並行で要約。終わったものから state/summaries/ に保存する。"""
+    CACHE.mkdir(parents=True, exist_ok=True)
+    ids = {v["id"] for v in videos}
+    for f in CACHE.glob("*.md"):  # 対象外になった古い途中保存は削除
+        if f.stem not in ids:
+            f.unlink()
+    c = cfg["collect"]
+
+    def work(v):
+        f = CACHE / f"{v['id']}.md"
+        if f.exists():
+            log(f"要約（保存済みを使用）: {v['title'][:40]}")
+            return f.read_text("utf-8")
+        log(f"要約開始: {v['title'][:40]}")
+        t0 = time.time()
+        s = summarize(client, cfg["models"]["summary"], v, c.get("video_fps", 0.2))
+        f.write_text(s, "utf-8")
+        log(f"  ✓ 要約完了（{(time.time() - t0) / 60:.1f}分）: {v['title'][:40]}")
+        return s
+
+    results = {}
+    with ThreadPoolExecutor(max_workers=c.get("parallel", 3)) as ex:
+        futs = {ex.submit(work, v): v for v in videos}
+        for fu in as_completed(futs):
+            v = futs[fu]
+            try:
+                results[v["id"]] = fu.result()
+            except Exception as e:  # noqa: BLE001
+                log(f"  ⚠ 要約できませんでした（次回再試行）: {v['title'][:40]}: {e}")
+    done = [v for v in videos if v["id"] in results]
+    notes = [f"## {v['channel']}「{v['title']}」\n{results[v['id']]}" for v in done]
+    return done, notes
 
 
 # ---------------------------------------------------------------- 3. 台本
@@ -444,16 +495,7 @@ def main():
     client = genai.Client(api_key=os.environ["GEMINI_API_KEY"],
                           http_options=types.HttpOptions(api_version="v1beta"))
 
-    notes, done = [], []
-    for v in videos:
-        log(f"要約中: {v['title']}")
-        try:
-            s = summarize(client, cfg["models"]["summary"], v)
-        except Exception as e:  # noqa: BLE001
-            log(f"  ⚠ 要約できませんでした（次回再試行）: {e}")
-            continue
-        notes.append(f"## {v['channel']}「{v['title']}」\n{s}")
-        done.append(v)
+    done, notes = summarize_all(client, cfg, videos)
     if not done:
         return finish_without_episode("要約できた動画がないため今日はお休みです。")
 
@@ -491,6 +533,7 @@ def main():
 
     for v in done:
         state["processed"][v["id"]] = now.date().isoformat()
+        (CACHE / f"{v['id']}.md").unlink(missing_ok=True)
     limit = (now.date() - dt.timedelta(days=30)).isoformat()
     state["processed"] = {k: d for k, d in state["processed"].items() if d >= limit}
 
