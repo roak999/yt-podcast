@@ -33,6 +33,8 @@ collect:
   lookback_hours: 48         # 何時間前までの動画を対象にするか（取りこぼし防止で48時間）
   max_videos: 8              # 1日に扱う最大本数
   skip_shorts: true          # ショート動画は除外
+  parallel: 3                # 同時に要約する本数
+  video_fps: 0.2             # 映像を何秒に1コマ見るか（0.2 = 5秒に1コマ。話が中心の動画なら十分）
 
 script:
   target_minutes: 30         # 音声の長さの目安（分）
