@@ -58,6 +58,11 @@ def is_not_found(e: Exception) -> bool:
     return "NOT_FOUND" in str(e) or "404" in str(e)[:20]
 
 
+def is_bad_request(e: Exception) -> bool:
+    """400: そのモデルが今の呼び出し方に対応していない。"""
+    return "INVALID_ARGUMENT" in str(e)[:40]
+
+
 def is_busy(e: Exception) -> bool:
     """混雑(503)や回数制限(429)。別のモデルに切り替えると通ることが多い。"""
     t = str(e)[:40]
@@ -69,7 +74,7 @@ def with_retry(fn, what: str, tries: int = 4, base: int = 30):
         try:
             return fn()
         except Exception as e:  # noqa: BLE001
-            if i == tries - 1 or is_not_found(e):
+            if i == tries - 1 or is_not_found(e) or is_bad_request(e):
                 raise
             wait = base * (2 ** i)
             log(f"  {what} 失敗: {e} → {wait}秒後に再試行")
@@ -89,12 +94,13 @@ def with_models(models, fn, what: str):
             try:
                 return with_retry(lambda: fn(m), f"{what}（{m}）", tries=2, base=15)
             except Exception as e:  # noqa: BLE001
-                if not (is_not_found(e) or is_busy(e)):
+                if not (is_not_found(e) or is_busy(e) or is_bad_request(e)):
                     raise
                 last = e
                 nxt = names[i + 1] if i < len(names) - 1 else None
                 if nxt:
-                    log(f"  {m} は{'使えません' if is_not_found(e) else '混雑中'} → {nxt} を試します")
+                    why = "混雑中" if is_busy(e) else "使えません"
+                    log(f"  {m} は{why} → {nxt} を試します")
         if not is_busy(last) or rnd == 2:
             raise last
         log("  すべてのモデルが混雑中 → 2分待って再挑戦")
@@ -361,14 +367,40 @@ def tts_gemini(client, cfg: dict, lines: list[dict]) -> bytes:
     chunks = chunk_lines(lines, t["chunk_chars"])
     tts_models = model_list(cfg["models"]["tts"])
     pcm = bytearray()
+    style = "落ち着いた聞き取りやすいテンポで、投資ニュース番組の自然な掛け合いとして話す"
+    fmt = {}  # モデルごとに、通った書き方を覚えておく
+
     for i, ch in enumerate(chunks, 1):
         text = prefix + "\n".join(f"{l['speaker']}: {l['text']}" for l in ch)
+        # 新しいモデル（3.8〜）: セリフごとに話者を指定する書き方
+        variants = {
+            "parts": types.Content(role="user", parts=[
+                types.Part(text=l["text"], speech_metadata=types.SpeechMetadata(speaker=l["speaker"], style=style))
+                for l in ch]),
+            "parts_plain": types.Content(role="user", parts=[
+                types.Part(text=l["text"], speech_metadata=types.SpeechMetadata(speaker=l["speaker"]))
+                for l in ch]),
+            "text": text,  # 旧モデル（3.1以前）の書き方
+        }
         n_chars = sum(len(l["text"]) for l in ch)
 
-        def call(model):
-            r = client.models.generate_content(
-                model=model, contents=text,
+        def gen(model, contents):
+            return client.models.generate_content(
+                model=model, contents=contents,
                 config=types.GenerateContentConfig(response_modalities=["AUDIO"], speech_config=speech))
+
+        def call(model):
+            order = [fmt[model]] if model in fmt else list(variants)
+            for k, f in enumerate(order):
+                try:
+                    r = gen(model, variants[f])
+                    fmt[model] = f
+                    break
+                except Exception as e:  # noqa: BLE001
+                    if is_bad_request(e) and k < len(order) - 1:
+                        log(f"  {model}: 別の書き方で再送します")
+                        continue
+                    raise
             part = r.candidates[0].content.parts[0].inline_data
             data = part.data
             m = re.search(r"rate=(\d+)", part.mime_type or "")
@@ -500,8 +532,16 @@ def main():
         return finish_without_episode("要約できた動画がないため今日はお休みです。")
 
     now = dt.datetime.now(JST)
-    log("台本作成中…")
-    script = make_script(client, cfg, "\n\n".join(notes), now.date())
+    script_cache = CACHE / "_script.json"
+    ids = sorted(v["id"] for v in done)
+    cached = json.loads(script_cache.read_text("utf-8")) if script_cache.exists() else {}
+    if cached.get("ids") == ids:
+        log("台本（保存済みを使用）")
+        script = cached["script"]
+    else:
+        log("台本作成中…")
+        script = make_script(client, cfg, "\n\n".join(notes), now.date())
+        script_cache.write_text(json.dumps({"ids": ids, "script": script}, ensure_ascii=False), "utf-8")
     log(f"  台本: {len(script['lines'])}行 / {sum(len(l['text']) for l in script['lines'])}文字")
 
     log("音声合成中…")
@@ -534,6 +574,7 @@ def main():
     for v in done:
         state["processed"][v["id"]] = now.date().isoformat()
         (CACHE / f"{v['id']}.md").unlink(missing_ok=True)
+    script_cache.unlink(missing_ok=True)
     limit = (now.date() - dt.timedelta(days=30)).isoformat()
     state["processed"] = {k: d for k, d in state["processed"].items() if d >= limit}
 
