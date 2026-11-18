@@ -26,6 +26,7 @@ import tempfile
 import time
 import xml.etree.ElementTree as ET
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from concurrent.futures import TimeoutError as FuturesTimeout
 from pathlib import Path
 from xml.sax.saxutils import escape
 
@@ -72,10 +73,16 @@ def is_daily_limit(e: Exception) -> bool:
 EXHAUSTED: set[str] = set()  # この実行中、1日の上限に達したモデル
 
 
+def is_timeout(e: Exception) -> bool:
+    """応答が返ってこない（時間切れ）。"""
+    t = f"{type(e).__name__} {str(e)[:80]}".lower()
+    return "timeout" in t or "timed out" in t or "504" in t or "deadline" in t
+
+
 def is_busy(e: Exception) -> bool:
-    """混雑(503)や回数制限(429)。別のモデルに切り替えると通ることが多い。"""
+    """混雑(503)・回数制限(429)・応答なし。別のモデルに切り替えると通ることが多い。"""
     t = str(e)[:40]
-    return any(k in t for k in ("503", "UNAVAILABLE", "429", "RESOURCE_EXHAUSTED"))
+    return is_timeout(e) or any(k in t for k in ("503", "UNAVAILABLE", "429", "RESOURCE_EXHAUSTED"))
 
 
 def with_retry(fn, what: str, tries: int = 4, base: int = 30):
@@ -83,7 +90,7 @@ def with_retry(fn, what: str, tries: int = 4, base: int = 30):
         try:
             return fn()
         except Exception as e:  # noqa: BLE001
-            if i == tries - 1 or is_not_found(e) or is_bad_request(e) or is_daily_limit(e):
+            if i == tries - 1 or is_not_found(e) or is_bad_request(e) or is_daily_limit(e) or is_timeout(e):
                 raise
             wait = base * (2 ** i)
             log(f"  {what} 失敗: {e} → {wait}秒後に再試行")
@@ -113,7 +120,7 @@ def with_models(models, fn, what: str):
                     EXHAUSTED.add(m)
                     why = "今日の無料枠を使い切りました"
                 else:
-                    why = "混雑中" if is_busy(e) else "使えません"
+                    why = "応答がありません" if is_timeout(e) else "混雑中" if is_busy(e) else "使えません"
                 nxt = next((n for n in names[i + 1:] if n not in EXHAUSTED), None)
                 if nxt:
                     log(f"  {m} は{why} → {nxt} を試します")
@@ -280,17 +287,30 @@ def summarize_all(client, cfg: dict, videos: list[dict]) -> tuple[list[dict], li
         return s
 
     results = {}
-    with ThreadPoolExecutor(max_workers=c.get("parallel", 3)) as ex:
-        futs = {ex.submit(work, v): v for v in videos}
-        for fu in as_completed(futs):
+    limit_min = c.get("summary_minutes", 45)
+    ex = ThreadPoolExecutor(max_workers=c.get("parallel", 3))
+    futs = {ex.submit(work, v): v for v in videos}
+    try:
+        for fu in as_completed(futs, timeout=limit_min * 60):
             v = futs[fu]
             try:
                 results[v["id"]] = fu.result()
             except Exception as e:  # noqa: BLE001
                 log(f"  ⚠ 要約できませんでした（次回再試行）: {v['title'][:40]}: {e}")
+    except FuturesTimeout:
+        left = [futs[f]["title"][:40] for f in futs if not f.done()]
+        log(f"⚠ 要約の制限時間（{limit_min}分）を過ぎたため、終わった分だけで番組を作ります。次回に回す動画:")
+        for t in left:
+            log(f"  - {t}")
+        global STRAGGLERS
+        STRAGGLERS = True
+    ex.shutdown(wait=False, cancel_futures=True)
     done = [v for v in videos if v["id"] in results]
     notes = [f"## {v['channel']}「{v['title']}」\n{results[v['id']]}" for v in done]
     return done, notes
+
+
+STRAGGLERS = False  # 要約が終わらないまま残っている処理があるか
 
 
 # ---------------------------------------------------------------- 3. 台本
@@ -545,7 +565,9 @@ def main():
     from google import genai
     from google.genai import types
     client = genai.Client(api_key=os.environ["GEMINI_API_KEY"],
-                          http_options=types.HttpOptions(api_version="v1beta"))
+                          http_options=types.HttpOptions(
+                              api_version="v1beta",
+                              timeout=cfg.get("request_timeout_minutes", 10) * 60 * 1000))
 
     done, notes = summarize_all(client, cfg, videos)
     if not done:
@@ -607,4 +629,17 @@ def main():
 
 
 if __name__ == "__main__":
-    main()
+    import traceback
+    code = 0
+    try:
+        main()
+    except SystemExit as e:
+        code = e.code if isinstance(e.code, int) else 1
+    except BaseException:  # noqa: BLE001
+        traceback.print_exc()
+        code = 1
+    if STRAGGLERS:  # 応答待ちのまま残った処理は待たずに終了する
+        sys.stdout.flush()
+        sys.stderr.flush()
+        os._exit(code)
+    sys.exit(code)
