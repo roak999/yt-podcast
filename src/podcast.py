@@ -314,62 +314,119 @@ STRAGGLERS = False  # 要約が終わらないまま残っている処理があ�
 
 
 # ---------------------------------------------------------------- 3. 台本
-SCRIPT_PROMPT = """あなたは投資情報ポッドキャストの構成作家です。以下は、今日フォローしているYouTubeチャンネルに投稿された動画の要約メモです。
-これをもとに、{a}と{b}の2人による日本語の掛け合い台本を書いてください。
-
-# 番組
-- 番組名: {title}
-- 日付: {date}
+RULES = """# 共通ルール
 - 聞き手はジムで運動しながら聞く個人投資家。耳だけで理解できるよう短めの文で話し、数字は聞き取りやすく言う（例:「3.5%」→「3.5パーセント」）
-
-# 登場人物
-- {a}: {a_role}
-- {b}: {b_role}
-
-# 構成
-1. オープニング（今日扱う動画の本数と、全体の雰囲気をひと言で）
-2. 動画ごとのコーナー。冒頭で必ずチャンネル名と動画の主題を紹介し、主張・根拠・リスクを掛け合いで深掘りする
-3. 複数の動画に共通していた見方や、意見が分かれていた点の整理
-4. エンディング（今日のポイントを3つ程度で振り返り、「最終的な判断はご自身で」と添える）
-
-# ルール
-- 全体で約{chars}文字（読み上げ約{minutes}分）を目安にする。動画の内容が少ない日は無理に引き延ばさず短くてよい
-- 要約メモにない事実・数字を足さない。主張は「〇〇さんは〜と見ている」のように誰の意見か分かる形で伝える
+- 要約メモにない事実・数字を足さない。主張は「〇〇さんは〜と見ている」のように、誰の意見か分かる形で伝える
 - 番組として特定銘柄の売買を勧めない
 - セリフにト書き・記号・URLを入れない。英語の略語は読み方が分かるように（例: FRB→エフアールビー）
 - 1つのセリフは長くても200文字程度まで
+"""
 
+CAST = """# 登場人物
+- {a}: {a_role}
+- {b}: {b_role}
+"""
+
+CORNER_PROMPT = """あなたは投資情報ポッドキャスト「{title}」の構成作家です。
+{a}と{b}の2人による掛け合い台本のうち、動画1本を扱うコーナー（{k}本目／全{n}本）を書いてください。
+
+{cast}
+# このコーナーで扱う動画
+- チャンネル: {channel}
+- タイトル: {vtitle}
+
+# 書き方
+- 冒頭は「{k}本目は」のようにつなぎ、チャンネル名と動画の主題を紹介する
+- 主な主張、その根拠のデータや数字、リスクや注意点を、聞き役の質問を交えながら順に深掘りする
+- 最後にこのコーナーの要点をひと言でまとめる
+- 番組全体のあいさつや締めくくりは書かない（別パートで書く）
+- **長さは約{chars}文字（読み上げ約{minutes}分）**。要約メモの内容をできるだけ漏らさず取り上げて、この長さに届かせる
+
+{rules}
 # 出力形式（JSONのみ）
-{{"title": "エピソードのタイトル（30文字程度）", "description": "エピソードの概要（100〜200文字）", "lines": [{{"speaker": "{a}", "text": "..."}}, {{"speaker": "{b}", "text": "..."}}]}}
+{{"lines": [{{"speaker": "{a}", "text": "..."}}, {{"speaker": "{b}", "text": "..."}}]}}
 
-# 要約メモ
+# この動画の要約メモ
 {notes}
 """
 
+FRAME_PROMPT = """あなたは投資情報ポッドキャスト「{title}」の構成作家です。今日（{date}）は{n}本の動画を1本ずつ紹介します。
+番組の「オープニング」と「エンディング」の掛け合い台本、エピソードのタイトルと概要を書いてください（各動画のコーナーは別に書くので不要）。
 
-def make_script(client, cfg: dict, notes: str, today: dt.date) -> dict:
+{cast}
+# オープニング（約{open_chars}文字）
+日付、今日扱う動画の本数、全体の雰囲気や大きなテーマをひと言で
+
+# エンディング（約{close_chars}文字）
+- 複数の動画に共通していた見方と、意見が分かれていた点を整理する
+- 今日のポイントを3つ程度で振り返る
+- 最後に「最終的な判断はご自身で」と添えて締める
+
+{rules}
+# 出力形式（JSONのみ）
+{{"title": "エピソードのタイトル（30文字程度）", "description": "エピソードの概要（100〜200文字）",
+  "opening": [{{"speaker": "{a}", "text": "..."}}], "closing": [{{"speaker": "{b}", "text": "..."}}]}}
+
+# 今日の動画の要約メモ
+{notes}
+"""
+
+MORE = "\n\n# 注意\n前回の案は約{got}文字で短すぎました。必ず{chars}文字以上になるよう、要約メモの論点をもっと具体的に掛け合いで掘り下げてください。"
+
+
+def clean_lines(raw, names) -> list[dict]:
+    return [{"speaker": l["speaker"], "text": l["text"].strip()}
+            for l in raw or [] if isinstance(l, dict) and l.get("speaker") in names and str(l.get("text", "")).strip()]
+
+
+def n_chars(lines) -> int:
+    return sum(len(l["text"]) for l in lines)
+
+
+def make_script(client, cfg: dict, done: list[dict], notes: list[str], today: dt.date) -> dict:
+    """台本を「オープニング＋エンディング」と「動画ごとのコーナー」に分けて書かせる。
+    1回でまとめて書かせると短くなりがちなので、コーナーごとに長さを指定する。"""
     from google.genai import types
     s = cfg["script"]
     a, b = s["hosts"][0], s["hosts"][1]
-    prompt = SCRIPT_PROMPT.format(
-        a=a["name"], b=b["name"], a_role=a["role"], b_role=b["role"],
-        title=cfg["podcast"]["title"], date=f"{today.year}年{today.month}月{today.day}日",
-        chars=s["target_minutes"] * 320, minutes=s["target_minutes"], notes=notes)
+    names = {a["name"], b["name"]}
+    cast = CAST.format(a=a["name"], b=b["name"], a_role=a["role"], b_role=b["role"])
+    base = dict(a=a["name"], b=b["name"], title=cfg["podcast"]["title"], cast=cast, rules=RULES)
+    models = cfg["models"]["script"]
+    cpm = s.get("chars_per_minute", 320)
+    total = s["target_minutes"] * cpm
+    open_chars, close_chars = 500, 1200
+    per = max(600, (total - open_chars - close_chars) // max(1, len(done)))
 
-    def call(model):
-        r = client.models.generate_content(
-            model=model, contents=prompt,
-            config=types.GenerateContentConfig(response_mime_type="application/json", max_output_tokens=60000))
-        data = json.loads(r.text)
-        names = {a["name"], b["name"]}
-        lines = [{"speaker": l["speaker"], "text": l["text"].strip()}
-                 for l in data["lines"] if l.get("speaker") in names and l.get("text", "").strip()]
-        if len(lines) < 10:
-            raise RuntimeError(f"台本が短すぎます（{len(lines)}行）")
-        data["lines"] = lines
-        return data
+    def ask(prompt):
+        def call(model):
+            r = client.models.generate_content(
+                model=model, contents=prompt,
+                config=types.GenerateContentConfig(response_mime_type="application/json", max_output_tokens=60000))
+            return json.loads(r.text)
+        return with_models(models, call, "台本作成")
 
-    return with_models(cfg["models"]["script"], call, "台本作成")
+    log("台本作成中: オープニング・エンディング")
+    frame = ask(FRAME_PROMPT.format(**base, date=f"{today.year}年{today.month}月{today.day}日", n=len(done),
+                                    open_chars=open_chars, close_chars=close_chars, notes="\n\n".join(notes)))
+
+    lines = clean_lines(frame.get("opening"), names)
+    for k, (v, note) in enumerate(zip(done, notes), 1):
+        prompt = CORNER_PROMPT.format(**base, k=k, n=len(done), channel=v["channel"], vtitle=v["title"],
+                                      chars=per, minutes=round(per / cpm, 1), notes=note)
+        corner = clean_lines(ask(prompt).get("lines"), names)
+        if n_chars(corner) < per * 0.6:  # 短すぎたら1回だけ書き直させ、長い方を使う
+            log(f"  コーナー{k}: {n_chars(corner)}文字で短いため書き直し")
+            retry = clean_lines(ask(prompt + MORE.format(got=n_chars(corner), chars=per)).get("lines"), names)
+            if n_chars(retry) > n_chars(corner):
+                corner = retry
+        log(f"  コーナー{k}/{len(done)}: {n_chars(corner)}文字（目標{per}）")
+        lines += corner
+    lines += clean_lines(frame.get("closing"), names)
+    if len(lines) < 10:
+        raise RuntimeError(f"台本が短すぎます（{len(lines)}行）")
+    return {"title": frame.get("title", "今日の投資YouTubeまとめ"),
+            "description": frame.get("description", ""), "lines": lines}
 
 
 # ---------------------------------------------------------------- 4. 音声
@@ -582,7 +639,7 @@ def main():
         script = cached["script"]
     else:
         log("台本作成中…")
-        script = make_script(client, cfg, "\n\n".join(notes), now.date())
+        script = make_script(client, cfg, done, notes, now.date())
         script_cache.write_text(json.dumps({"ids": ids, "script": script}, ensure_ascii=False), "utf-8")
     log(f"  台本: {len(script['lines'])}行 / {sum(len(l['text']) for l in script['lines'])}文字")
 
