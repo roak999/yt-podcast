@@ -1,0 +1,61 @@
+# ============================================================
+#  設定ファイル（ここを書き換えるだけで動作を変えられます）
+# ============================================================
+
+podcast:
+  title: "投資YouTube デイリーまとめ"
+  description: "フォローしている投資系YouTubeチャンネルの新着動画を、毎日2人の掛け合いで解説する個人用ポッドキャスト。"
+  author: "自分用"
+  keep_episodes: 14          # 何日分の音声を残すか（古いものは自動削除）
+
+# 対象チャンネル（追加・削除はここで。id が分からなければ url だけでもOK）
+channels:
+  - name: バフェット太郎
+    id: UCQPPXy9LCznUQHHG_kh6Bpg
+    url: https://www.youtube.com/@buffett_taro
+  - name: 高田資産コンサル
+    id: UCzhFASYte7zGWIgVS7PgUaA
+    url: https://www.youtube.com/@takadatomoo
+  - name: 楽待 RAKUMACHI
+    id: UCPMJKbrxtpARoTd1b49iUvA
+    url: https://www.youtube.com/@rakumachi
+  - name: 朝倉慶のASK1
+    id: UCax09PmcRoY1R8mfJFBfv0g
+    url: https://www.youtube.com/@info_ask1
+  - name: いけがみ【元メガバンク機関投資家】
+    id: UCkh8USYh3M-4C94dJQonIgQ
+    url: https://www.youtube.com/channel/UCkh8USYh3M-4C94dJQonIgQ
+  - name: 株投ハタチャンネル
+    id: UCpWK3NCiag-XgdoliCO7Hcw
+    url: https://www.youtube.com/@ukyou220
+
+collect:
+  lookback_hours: 48         # 何時間前までの動画を対象にするか（取りこぼし防止で48時間）
+  max_videos: 8              # 1日に扱う最大本数
+  skip_shorts: true          # ショート動画は除外
+  parallel: 3                # 同時に要約する本数
+  video_fps: 0.2             # 映像を何秒に1コマ見るか（0.2 = 5秒に1コマ。話が中心の動画なら十分）
+
+script:
+  target_minutes: 30         # 音声の長さの目安（分）
+  chars_per_minute: 320      # 1分あたりの読み上げ文字数（実際の長さが目安とずれる場合はここで調整）
+  hosts:
+    - name: ケン
+      role: 解説役。動画の内容を整理して、要点と根拠を分かりやすく説明する
+      voice: Charon                  # Gemini の声
+      edge_voice: ja-JP-KeitaNeural  # 無料モード時の声
+    - name: ミホ
+      role: 聞き役。個人投資家目線で素朴な疑問を投げかけ、要点を確認する
+      voice: Aoede
+      edge_voice: ja-JP-NanamiNeural
+
+# モデル名は [第1候補, 予備…] の順に書く。第1候補が使えない・混雑しているときは自動で次を試す
+models:
+  summary: [gemini-3.8-flash, gemini-3.6-flash, gemini-3.5-flash, gemini-3.5-flash-lite, gemini-3.1-flash-lite]     # 動画の要約（安くしたい場合は先頭を gemini-3.5-flash-lite に）
+  script: [gemini-3.8-flash, gemini-3.6-flash, gemini-3.5-flash, gemini-3.5-flash-lite, gemini-3.1-flash-lite]           # 台本づくり
+  tts: [gemini-3.8-flash-tts, gemini-3.8-flash-lite-tts, gemini-3.1-flash-tts-preview]          # 音声合成（安くしたい場合は先頭を gemini-3.8-flash-lite-tts に）
+
+tts:
+  backend: gemini        # gemini（高品質・有料枠あり） / edge（無料・やや機械的）
+  chunk_chars: 1500      # 1回の音声合成に渡す文字数（大きいほど呼び出し回数が減り、無料枠を節約できる）
+  wait_seconds: 20       # 音声合成の呼び出し間隔（無料枠の回数制限対策）
