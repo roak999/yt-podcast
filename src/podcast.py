@@ -434,6 +434,40 @@ def silence(sec: float) -> bytes:
     return b"\x00\x00" * int(SAMPLE_RATE * sec)
 
 
+def clean_tts_audio(data: bytes) -> bytes:
+    """Gemini TTSが音声の末尾に付けることがある「ジジッ」という雑音（0.1〜0.4秒の大きな音）を取り除き、
+    つなぎ目でプツッと鳴らないよう前後を短くフェードさせる。
+    判定: 間（0.2秒以上の無音）のあとに来る、末尾の短く大きな音だけを雑音とみなす。"""
+    import numpy as np
+    a = np.frombuffer(data, dtype="<i2").astype(np.float32)
+    fl = int(0.02 * SAMPLE_RATE)
+    for _ in range(2):  # まれに2回続くことがある
+        n = len(a) // fl
+        if n < 50:
+            break
+        r = np.sqrt(((a[: n * fl].reshape(n, fl) / 32768) ** 2).mean(1))
+        end = n
+        while end > 0 and r[end - 1] < 0.005:
+            end -= 1
+        start = end
+        while start > 0 and r[start - 1] >= 0.005:
+            start -= 1
+        q = start
+        while q > 0 and r[q - 1] < 0.005:
+            q -= 1
+        burst, pause = (end - start) * 0.02, (start - q) * 0.02
+        if 0 < burst <= 0.4 and pause >= 0.2 and r[start:end].max() > 0.25:
+            a = a[: start * fl]
+        else:
+            break
+    k = min(len(a) // 2, int(0.015 * SAMPLE_RATE))
+    if k:
+        ramp = np.linspace(0, 1, k, dtype=np.float32)
+        a[:k] *= ramp
+        a[-k:] *= ramp[::-1]
+    return np.clip(a, -32768, 32767).astype("<i2").tobytes()
+
+
 def chunk_lines(lines: list[dict], max_chars: int) -> list[list[dict]]:
     chunks, cur, n = [], [], 0
     for ln in lines:
@@ -509,7 +543,7 @@ def tts_gemini(client, cfg: dict, lines: list[dict]) -> bytes:
             return data
 
         log(f"  音声合成 {i}/{len(chunks)}（{n_chars}文字）")
-        pcm += with_models(tts_models, call, f"音声合成 {i}") + silence(0.4)
+        pcm += clean_tts_audio(with_models(tts_models, call, f"音声合成 {i}")) + silence(0.4)
         if i < len(chunks):
             time.sleep(t["wait_seconds"])
     return bytes(pcm)
