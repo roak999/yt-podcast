@@ -42,7 +42,8 @@ OUT = ROOT / "out"
 
 JST = dt.timezone(dt.timedelta(hours=9))
 SAMPLE_RATE = 24000  # Gemini TTS の出力（16bit / mono / 24kHz）
-NS = {"atom": "http://www.w3.org/2005/Atom", "yt": "http://www.youtube.com/xml/schemas/2015"}
+NS = {"atom": "http://www.w3.org/2005/Atom", "yt": "http://www.youtube.com/xml/schemas/2015",
+      "media": "http://search.yahoo.com/mrss/"}
 UA = {"User-Agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/130 Safari/537.36",
       "Accept-Language": "ja,en;q=0.8"}
 
@@ -180,9 +181,20 @@ def resolve_channel_id(url: str) -> str | None:
     return None
 
 
-def collect_videos(cfg: dict, state: dict) -> list[dict]:
+def target_day(now: dt.datetime, cfg: dict) -> dt.date:
+    """どの日の配信を対象にするか（日本時間）。
+    GitHubの都合で実行が翌朝にずれ込むことがあるので、正午より前の実行は前日分として扱う。"""
+    day = now.date()
+    if now.hour < cfg["collect"].get("day_boundary_hour", 12):
+        day -= dt.timedelta(days=1)
+    return day
+
+
+def collect_videos(cfg: dict, state: dict, day: dt.date) -> list[dict]:
+    """対象日（日本時間 0:00〜23:59）に配信された動画を集める。"""
     c = cfg["collect"]
-    cutoff = dt.datetime.now(dt.timezone.utc) - dt.timedelta(hours=c["lookback_hours"])
+    start = dt.datetime.combine(day, dt.time(0, 0), JST)
+    end = start + dt.timedelta(days=1)
     videos = []
     for ch in cfg["channels"]:
         name = ch["name"]
@@ -202,19 +214,72 @@ def collect_videos(cfg: dict, state: dict) -> list[dict]:
             published = dt.datetime.fromisoformat(e.findtext("atom:published", namespaces=NS))
             link_el = e.find("atom:link", NS)
             link = link_el.get("href", "") if link_el is not None else ""
-            if not vid or vid in state["processed"] or published < cutoff:
+            if not vid or vid in state["processed"] or not (start <= published < end):
                 continue
             if c.get("skip_shorts", True) and "/shorts/" in link:
                 continue
+            desc = e.findtext("media:group/media:description", namespaces=NS) or ""
             videos.append({
                 "id": vid,
                 "title": e.findtext("atom:title", namespaces=NS) or "",
+                "desc": desc[:300],
                 "channel": name,
                 "published": published.isoformat(),
                 "url": f"https://www.youtube.com/watch?v={vid}",
             })
     videos.sort(key=lambda v: v["published"])
-    return videos[-c["max_videos"]:]
+    return videos
+
+
+# ---------------------------------------------------------------- 1.5 投資に関係する動画だけに絞る
+FILTER_PROMPT = """以下は投資系YouTubeチャンネルの新着動画の一覧です。個人投資家向けの「投資の番組」に入れる動画かどうかを判定してください。
+
+# 入れる（keep: true）
+{keep}
+
+# 入れない（keep: false）
+{drop}
+
+迷ったら、タイトルと概要の中心が上の「入れる」に当てはまるかで判断してください。
+
+# 出力形式（JSONのみ）
+{{"results": [{{"id": "動画ID", "keep": true, "reason": "10文字程度の理由"}}]}}
+
+# 動画一覧
+{items}
+"""
+
+
+def filter_videos(client, cfg: dict, videos: list[dict]) -> tuple[list[dict], list[dict]]:
+    """投資に関係ない動画・不動産の動画を除く。(残す動画, 除いた動画) を返す。"""
+    from google.genai import types
+    f = cfg.get("filter", {})
+    if not videos or not f.get("enabled", True):
+        return videos, []
+    items = "\n".join(f"- id: {v['id']}\n  チャンネル: {v['channel']}\n  タイトル: {v['title']}\n"
+                      f"  概要: {v.get('desc', '').replace(chr(10), ' ')[:200]}" for v in videos)
+    prompt = FILTER_PROMPT.format(keep="\n".join(f"- {t}" for t in f["keep"]),
+                                  drop="\n".join(f"- {t}" for t in f["drop"]), items=items)
+
+    def call(model):
+        r = client.models.generate_content(
+            model=model, contents=prompt,
+            config=types.GenerateContentConfig(response_mime_type="application/json"))
+        return {x["id"]: x for x in json.loads(r.text)["results"]}
+
+    try:
+        res = with_models(cfg["models"].get("filter", cfg["models"]["summary"]), call, "動画の選別")
+    except Exception as e:  # noqa: BLE001
+        log(f"  ⚠ AIでの選別に失敗したため、キーワードで選別します: {e}")
+        words = f.get("drop_keywords", [])
+        res = {v["id"]: {"keep": not any(w in v["title"] for w in words), "reason": "キーワード判定"} for v in videos}
+    keep, drop = [], []
+    for v in videos:
+        r = res.get(v["id"], {"keep": True})
+        (keep if r.get("keep", True) else drop).append(v)
+        if not r.get("keep", True):
+            log(f"  除外（{r.get('reason', '')}）: [{v['channel']}] {v['title'][:50]}")
+    return keep, drop
 
 
 # ---------------------------------------------------------------- 2. 要約
@@ -435,31 +500,24 @@ def silence(sec: float) -> bytes:
 
 
 def clean_tts_audio(data: bytes) -> bytes:
-    """Gemini TTSが音声の末尾に付けることがある「ジジッ」という雑音（0.1〜0.4秒の大きな音）を取り除き、
-    つなぎ目でプツッと鳴らないよう前後を短くフェードさせる。
-    判定: 間（0.2秒以上の無音）のあとに来る、末尾の短く大きな音だけを雑音とみなす。"""
+    """Gemini TTSが音声の末尾に付ける「ジジッ」という雑音を取り除き、つなぎ目を短くフェードさせる。
+    雑音の特徴: 末尾1.5秒以内に現れる「大きくて（RMS>0.3）ザラついた（ゼロ交差率>0.2）」音。
+    通常の声はこの2つを同時に満たさない（実際の放送回1時間分で確認済み）ので、
+    これに当たる部分から後ろを切り落とす。"""
     import numpy as np
     a = np.frombuffer(data, dtype="<i2").astype(np.float32)
     fl = int(0.02 * SAMPLE_RATE)
-    for _ in range(2):  # まれに2回続くことがある
-        n = len(a) // fl
-        if n < 50:
-            break
-        r = np.sqrt(((a[: n * fl].reshape(n, fl) / 32768) ** 2).mean(1))
-        end = n
-        while end > 0 and r[end - 1] < 0.005:
-            end -= 1
-        start = end
-        while start > 0 and r[start - 1] >= 0.005:
-            start -= 1
-        q = start
-        while q > 0 and r[q - 1] < 0.005:
-            q -= 1
-        burst, pause = (end - start) * 0.02, (start - q) * 0.02
-        if 0 < burst <= 0.4 and pause >= 0.2 and r[start:end].max() > 0.25:
-            a = a[: start * fl]
-        else:
-            break
+    n = len(a) // fl
+    if n >= 50:
+        f = a[: n * fl].reshape(n, fl) / 32768
+        r = np.sqrt((f ** 2).mean(1))
+        z = (np.abs(np.diff(np.sign(f), axis=1)) > 0).mean(1)
+        hit = np.where((r > 0.3) & (z > 0.2))[0]
+        hit = hit[hit >= n - int(1.5 / 0.02)]
+        if len(hit) >= 2:
+            cut = max(0, int(hit[0]) - 2) * fl  # 雑音の立ち上がり分も含めて切る
+            log(f"    末尾の雑音を除去（{(len(a) - cut) / SAMPLE_RATE:.2f}秒）")
+            a = a[:cut]
     k = min(len(a) // 2, int(0.015 * SAMPLE_RATE))
     if k:
         ramp = np.linspace(0, 1, k, dtype=np.float32)
@@ -637,7 +695,10 @@ def main():
     OUT.mkdir(exist_ok=True)
     DOCS.mkdir(exist_ok=True)
 
-    videos = collect_videos(cfg, state)
+    now_jst = dt.datetime.now(JST)
+    day = target_day(now_jst, cfg)
+    log(f"対象日: {day:%Y-%m-%d}（日本時間）に配信された動画")
+    videos = collect_videos(cfg, state, day)
     log(f"新着動画: {len(videos)}本")
     for v in videos:
         log(f"  - [{v['channel']}] {v['title']}")
@@ -660,6 +721,16 @@ def main():
                               api_version="v1beta",
                               timeout=cfg.get("request_timeout_minutes", 10) * 60 * 1000))
 
+    videos, dropped = filter_videos(client, cfg, videos)
+    for v in dropped:  # 除外した動画は二度と判定しない
+        state["processed"][v["id"]] = day.isoformat()
+    max_v = cfg["collect"]["max_videos"]
+    if len(videos) > max_v:
+        log(f"対象が{len(videos)}本あるため、新しい順に{max_v}本に絞ります")
+        videos = videos[-max_v:]
+    if not videos:
+        return finish_without_episode("投資に関係する新着がないため今日はお休みです。")
+
     done, notes = summarize_all(client, cfg, videos)
     if not done:
         return finish_without_episode("要約できた動画がないため今日はお休みです。")
@@ -673,7 +744,7 @@ def main():
         script = cached["script"]
     else:
         log("台本作成中…")
-        script = make_script(client, cfg, done, notes, now.date())
+        script = make_script(client, cfg, done, notes, day)
         script_cache.write_text(json.dumps({"ids": ids, "script": script}, ensure_ascii=False), "utf-8")
     log(f"  台本: {len(script['lines'])}行 / {sum(len(l['text']) for l in script['lines'])}文字")
 
@@ -684,7 +755,7 @@ def main():
         pcm = tts_gemini(client, cfg, script["lines"])
 
     tag = f"ep-{now:%Y%m%d-%H%M}"
-    title = f"{now.month}/{now.day} {script['title']}"
+    title = f"{day.month}/{day.day} {script['title']}"
     mp3 = OUT / f"{tag}.mp3"
     pcm_to_mp3(pcm, mp3, title)
     secs = len(pcm) // (2 * SAMPLE_RATE)

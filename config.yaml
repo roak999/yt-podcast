@@ -30,7 +30,7 @@ channels:
     url: https://www.youtube.com/@ukyou220
 
 collect:
-  lookback_hours: 48         # 何時間前までの動画を対象にするか（取りこぼし防止で48時間）
+  day_boundary_hour: 12      # 対象はその日（日本時間）に配信された動画だけ。実行がこの時刻より前にずれ込んだ場合は前日分を対象にする
   max_videos: 8              # 1日に扱う最大本数
   skip_shorts: true          # ショート動画は除外
   parallel: 3                # 同時に要約する本数
@@ -49,8 +49,25 @@ script:
       voice: Aoede
       edge_voice: ja-JP-NanamiNeural
 
+# 投資に関係する動画だけに絞る（AIがタイトルと概要から判定）
+filter:
+  enabled: true
+  keep:
+    - 株式・株価・相場の解説や予想（日本株・米国株・新興国株、個別銘柄、指数）
+    - 投資信託・ETF・新NISA・債券・配当・資産運用の方法
+    - 為替・金利・景気・金融政策など、投資判断に関わる経済の話
+    - 政治・選挙・国際情勢のうち、株式市場や経済への影響が主題のもの
+  drop:
+    - 不動産・不動産投資・マンション・土地・物件・建築・再開発・住宅ローンの話（株式市場の話が中心なら残す）
+    - 投資と関係のない話題（怪談、動物、エンタメ、人物インタビュー、旅行、生活の話など）
+    - 政治・選挙の話で、市場や経済への影響が主題でないもの
+    - 宣伝・セミナー告知・メンバー限定の案内だけの動画
+  # AIでの判定に失敗したときだけ使う予備のキーワード（タイトルにこれを含む動画を除外）
+  drop_keywords: [不動産, マンション, 物件, 土地, 怪談, ヒグマ, クマ, 大家, 賃貸, 住宅]
+
 # モデル名は [第1候補, 予備…] の順に書く。第1候補が使えない・混雑しているときは自動で次を試す
 models:
+  filter: [gemini-3.5-flash-lite, gemini-3.1-flash-lite, gemini-3.6-flash]   # 動画の選別（1日1回だけ。安いモデルで十分）
   summary: [gemini-3.8-flash, gemini-3.6-flash, gemini-3.5-flash, gemini-3.5-flash-lite, gemini-3.1-flash-lite]     # 動画の要約（安くしたい場合は先頭を gemini-3.5-flash-lite に）
   script: [gemini-3.8-flash, gemini-3.6-flash, gemini-3.5-flash, gemini-3.5-flash-lite, gemini-3.1-flash-lite]           # 台本づくり
   tts: [gemini-3.8-flash-tts, gemini-3.8-flash-lite-tts, gemini-3.1-flash-tts-preview]          # 音声合成（安くしたい場合は先頭を gemini-3.8-flash-lite-tts に）
