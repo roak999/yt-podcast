@@ -711,6 +711,12 @@ def main():
         save_state(state)
         gh_output(has_episode="false")
 
+    # 予備の時刻の定期実行で、同じ日のエピソードを二重に作らない（手動実行はいつでも作る）
+    if os.environ.get("GITHUB_EVENT_NAME") == "schedule" and any(
+            e.get("day") == day.isoformat() or e.get("title", "").startswith(f"{day.month}/{day.day} ")
+            for e in state["episodes"]):
+        return finish_without_episode(f"{day:%m/%d}のエピソードは作成済みのため、この実行は何もしません。")
+
     if not videos:
         return finish_without_episode("新着がないため今日はお休みです。")
 
@@ -763,7 +769,7 @@ def main():
 
     sources = "\n".join(f"・{v['channel']}「{v['title']}」 {v['url']}" for v in done)
     ep = {
-        "tag": tag, "guid": tag, "title": title,
+        "tag": tag, "guid": tag, "title": title, "day": day.isoformat(),
         "description": f"{script['description']}\n\n取り上げた動画:\n{sources}",
         "pub_date": email.utils.format_datetime(now),
         "url": f"https://github.com/{repo}/releases/download/{tag}/{mp3.name}",
